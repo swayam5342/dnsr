@@ -42,13 +42,15 @@ go build -o dnsr .
 ./dnsr -nomin www.github.com                 # send the full name to every server
 
 ./dnsr serve                                 # recursive server on udp+tcp 127.0.0.1:8053
-./dnsr serve -dnssec -dot 127.0.0.1:8853 -selfsigned   # …validating, plus DNS over TLS
+./dnsr serve -dnssec -dot 127.0.0.1:8853 -selfsigned   # …validating, plus DNS over TLS (1.3 only)
+./dnsr serve -addr 0.0.0.0:8053 -allow 127.0.0.0/8,192.168.0.0/16   # serve your LAN
 dig @127.0.0.1 -p 8053 example.com           # query it from another terminal
 ```
 
 Needs outbound UDP/TCP 53 to the internet (some campus / corporate networks
 block this and force their own resolver — try a phone hotspot if every root times out).
-The server defaults to port 8053 because 5353 is taken by mDNS on Windows.
+The server defaults to port 8053 because 5353 is taken by mDNS on Windows, and only
+answers loopback clients unless `-allow` lists other networks (everyone else gets REFUSED).
 
 ## What it implements
 
@@ -66,12 +68,16 @@ The server defaults to port 8053 because 5353 is taken by mDNS on Windows.
 | UDP → TCP on truncation (TC bit) | `resolver.go: exchangeTCP` | 2-byte length framing |
 | Answer, delegation and key caches | `resolver.go`, `dnssec.go` | TTL capped at 1 day, 10,000 entries each, delegations expire |
 | DNSSEC validation | `dnssec.go` | DS/DNSKEY chain from the IANA root anchors; RSA/SHA-2, ECDSA P-256/P-384, Ed25519 |
-| Recursive server | `server.go` | UDP + TCP + DNS over TLS, AD flag, SERVFAIL for bogus, rate limit, TC for big UDP replies |
+| Recursive server | `server.go` | UDP + TCP + DNS over TLS 1.3, access list, AD flag, SERVFAIL for bogus, rate limit, TC for big UDP replies |
 
 ### Security checks (the interesting part for a cyber-security angle)
 
 - **Random query IDs, and replies must match ID + question** — over UDP and TCP; a forged
-  packet with the wrong ID or question is dropped, not trusted.
+  packet with the wrong ID or question is dropped, not trusted. IDs come from `crypto/rand`.
+- **0x20 case randomisation** — every letter of the query name gets a random case
+  (`wWw.GiThUb.cOm`) and the reply must echo it exactly, adding about one bit of
+  entropy per letter. Servers that don't preserve case are detected and asked again
+  without it (`-no0x20` turns it off).
 - **Bailiwick check on referrals** — a `.com` server can only delegate names under
   `.com`, strictly below itself and above the target. Blocks redirect attacks.
 - **Bailiwick check on glue** — a `.com` server may vouch for `ns1.example.com`'s address,
@@ -80,6 +86,8 @@ The server defaults to port 8053 because 5353 is taken by mDNS on Windows.
   trust anchors (KSK-2017 and KSK-2024); tampered or mis-signed data is reported as bogus.
 - **Resource limits** — TTL cap, bounded caches, glueless lookup limit (NXNSAttack), and in
   server mode a per-client rate limit and a cap of 256 queries in flight.
+- **Access list** — the server only answers networks listed with `-allow` (loopback by default),
+  so binding to a public address doesn't turn it into an open resolver.
 - **Parser safety** — compression-pointer loop limit, name length limit, bounds checks everywhere.
 
 ## Tests
@@ -94,8 +102,9 @@ glueless.com …) on `127.0.0.10–15`, with the root, `com.` and `example.com.`
 so the full walk is tested offline and deterministically: referral chain, delegation cache,
 CNAME, NXDOMAIN/NODATA, MX, glueless delegation with poisoned glue, out-of-bailiwick referral,
 TC→TCP fallback, name compression, TTL cap, cache bounds, glueless limit, forged replies,
-mismatching TCP replies, QNAME minimisation, DNSSEC (secure, tampered, wrong anchor, unsigned),
-and the server (AD flag, truncation, rate limit, DNS over TLS).
+mismatching TCP replies, QNAME minimisation, 0x20 (including a server that ignores case),
+DNSSEC (secure, tampered, wrong anchor, unsigned), and the server (AD flag, truncation,
+rate limit, access list, DNS over TLS 1.3 only).
 
 ## Not (yet) implemented — good next steps
 
@@ -104,4 +113,4 @@ and the server (AD flag, truncation, rate limit, DNS over TLS).
 - Negative caching (RFC 2308) and caching CNAMEs under the alias name
 - IPv6 transport to nameservers (AAAA glue is parsed but only IPv4 is queried)
 - Parallel queries / RTT-based server selection (like Unbound's "smoothed RTT")
-- 0x20 case randomisation, DNS Cookies, DNS over HTTPS
+- DNS Cookies (RFC 7873), DNS over HTTPS

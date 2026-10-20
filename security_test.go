@@ -247,7 +247,7 @@ func TestDNSOverTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", dotConfig(cert))
 	if err != nil {
 		t.Skip(err)
 	}
@@ -299,5 +299,134 @@ func TestServerStripsDNSSECRecordsForPlainClients(t *testing.T) {
 	}
 	if sigs == 0 {
 		t.Fatal("client with DO=1 should receive the RRSIG")
+	}
+}
+
+func TestDNSOverTLSRequiresTLS13(t *testing.T) {
+	cert, _, err := selfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", dotConfig(cert))
+	if err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.(*tls.Conn).Handshake()
+			c.Close()
+		}
+	}()
+	if c, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12}); err == nil {
+		c.Close()
+		t.Fatal("a TLS 1.2 client was accepted")
+	}
+	c, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if v := c.ConnectionState().Version; v != tls.VersionTLS13 {
+		t.Fatalf("negotiated TLS version %x, want 1.3", v)
+	}
+}
+
+func TestQueryIDsAndCaseAreRandom(t *testing.T) {
+	ids := map[uint16]bool{}
+	for range 2000 {
+		ids[randomID()] = true
+	}
+	if len(ids) < 1900 {
+		t.Fatalf("only %d distinct IDs in 2000 draws", len(ids))
+	}
+	name := "www.example-domain-with-many-letters.com."
+	variants := map[string]bool{}
+	for range 20 {
+		m := randomCase(name)
+		if !strings.EqualFold(m, name) || len(m) != len(name) {
+			t.Fatalf("randomCase changed the name: %s", m)
+		}
+		variants[m] = true
+	}
+	if len(variants) < 19 {
+		t.Fatalf("only %d distinct case patterns in 20 draws", len(variants))
+	}
+}
+
+func TestQueriesUseRandomCaseAndAnswersAreLowercase(t *testing.T) {
+	n := newTestNet(t)
+	for _, name := range []string{"www.example.com", "mail.example.com", "alias.example.com"} {
+		res, err := n.r.Resolve(name, TypeA)
+		if err != nil || len(res.Answers) == 0 {
+			t.Fatalf("%s: %+v %v", name, res, err)
+		}
+		for _, rr := range res.Answers {
+			if rr.Name != strings.ToLower(rr.Name) {
+				t.Fatalf("answer name not normalised: %s", rr.Name)
+			}
+		}
+	}
+	mixed := 0
+	for _, q := range n.zones["example.com."].rawNames() {
+		if q != strings.ToLower(q) {
+			mixed++
+		}
+	}
+	if mixed == 0 {
+		t.Fatalf("no query used mixed case: %v", n.zones["example.com."].rawNames())
+	}
+}
+
+func TestCaseRandomisationFallsBackForServersThatDoNotPreserveCase(t *testing.T) {
+	n := newTestNet(t)
+	n.zones["example.com."].noCase = true
+	for _, name := range []string{"www.example.com", "mail.example.com", "alias.example.com", "big.example.com", "forged.example.com"} {
+		res, err := n.r.Resolve(name, TypeA)
+		if err != nil || len(res.Answers) == 0 {
+			t.Fatalf("%s failed against a case-insensitive server: %+v %v\n%s", name, res, err, n.trace)
+		}
+		if n.r.caseUnsafe("127.0.0.12") {
+			break
+		}
+	}
+	if !n.r.caseUnsafe("127.0.0.12") || !strings.Contains(n.trace.String(), "does not preserve letter case") {
+		t.Fatalf("fallback not recorded:\n%s", n.trace)
+	}
+}
+
+func TestServerAccessList(t *testing.T) {
+	n := newTestNet(t)
+	s := NewServer(n.r)
+	acl, err := ParseAllow("10.0.0.0/8, 192.168.1.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Allow = acl
+	addr := startTestServer(t, s)
+	m := udpAsk(t, addr, plainQuery(12, "www.example.com.", TypeA))
+	if m.Header.Rcode != RcodeRefused || len(m.Answers) != 0 {
+		t.Fatalf("client outside the list got %s with %d answers", rcodeString(m.Header.Rcode), len(m.Answers))
+	}
+	for ip, want := range map[string]bool{"10.1.2.3": true, "192.168.1.5": true, "192.168.1.6": false,
+		"127.0.0.1": false, "::ffff:10.0.0.1": true, "garbage": false} {
+		if got := s.permitted(ip); got != want {
+			t.Errorf("custom list: permitted(%s) = %v, want %v", ip, got, want)
+		}
+	}
+	def := NewServer(n.r)
+	for ip, want := range map[string]bool{"127.0.0.1": true, "127.5.5.5": true, "::1": true, "192.168.1.1": false} {
+		if got := def.permitted(ip); got != want {
+			t.Errorf("default list: permitted(%s) = %v, want %v", ip, got, want)
+		}
+	}
+	for _, bad := range []string{"10.0.0.0/33", "not-an-ip"} {
+		if _, err := ParseAllow(bad); err == nil {
+			t.Errorf("ParseAllow(%q) should fail", bad)
+		}
 	}
 }

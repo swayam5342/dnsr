@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -108,15 +109,79 @@ func buildResponse(id uint16, q Question, rd bool, rcode int, ans, auth, add []R
 }
 
 // Server answers DNS queries from clients using a shared Resolver. It limits
-// the number of queries in flight and the query rate of each client address.
+// the number of queries in flight and the query rate of each client address,
+// and only serves clients whose address is in Allow (loopback when empty).
 type Server struct {
 	R           *Resolver
 	MaxInflight int
 	Rate        float64
 	Burst       float64
+	Allow       []netip.Prefix
 	sem         chan struct{}
 	mu          sync.Mutex
 	buckets     map[string]*bucket
+	refused     map[string]time.Time
+}
+
+var loopbackOnly = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
+
+// ParseAllow reads a comma-separated list of CIDR ranges or single addresses.
+func ParseAllow(list string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, item := range strings.Split(list, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if strings.Contains(item, "/") {
+			p, err := netip.ParsePrefix(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(item)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, netip.PrefixFrom(a.Unmap(), a.Unmap().BitLen()))
+	}
+	return out, nil
+}
+
+// permitted reports whether a client address falls inside the access list.
+func (s *Server) permitted(ip string) bool {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap().WithZone("")
+	allow := s.Allow
+	if len(allow) == 0 {
+		allow = loopbackOnly
+	}
+	for _, p := range allow {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// noteRefused logs a refused client at most once per minute.
+func (s *Server) noteRefused(ip string) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.Sub(s.refused[ip]) < time.Minute {
+		return
+	}
+	if len(s.refused) > 10000 {
+		clear(s.refused)
+	}
+	s.refused[ip] = now
+	log.Printf("access list: refusing queries from %s", ip)
 }
 
 type bucket struct {
@@ -134,6 +199,7 @@ func (s *Server) init() {
 	if s.sem == nil {
 		s.sem = make(chan struct{}, s.MaxInflight)
 		s.buckets = map[string]*bucket{}
+		s.refused = map[string]time.Time{}
 	}
 }
 
@@ -174,10 +240,14 @@ func (s *Server) handle(pkt []byte, client string, udp bool) []byte {
 	if err != nil || len(m.Questions) != 1 || m.Header.QR {
 		return nil
 	}
+	q := m.Questions[0]
+	if !s.permitted(client) {
+		s.noteRefused(client)
+		return buildResponse(m.Header.ID, q, m.Header.RD, RcodeRefused, nil, nil, nil)
+	}
 	if !s.allow(client) {
 		return nil
 	}
-	q := m.Questions[0]
 	res, err := s.R.Resolve(q.Name, q.Type)
 	var out []byte
 	switch {
@@ -307,6 +377,11 @@ func (s *Server) ServeStream(ln net.Listener) error {
 	}
 }
 
+// dotConfig is the TLS configuration for DNS over TLS: TLS 1.3 only.
+func dotConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
+}
+
 // selfSignedCert creates an in-memory ECDSA certificate for localhost, for testing DoT.
 func selfSignedCert() (tls.Certificate, string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -348,6 +423,11 @@ func serve(cfg ServeConfig, s *Server) error {
 	}
 	host, port, _ := net.SplitHostPort(pc.LocalAddr().String())
 	log.Printf("dnsr listening on udp+tcp://%s — try: dig @%s -p %s example.com", pc.LocalAddr(), host, port)
+	allowed := s.Allow
+	if len(allowed) == 0 {
+		allowed = loopbackOnly
+	}
+	log.Printf("accepting clients from %v (change with -allow)", allowed)
 	errs := make(chan error, 3)
 	go func() { errs <- s.ServeUDP(pc) }()
 	go func() { errs <- s.ServeStream(ln) }()
@@ -368,7 +448,7 @@ func serve(cfg ServeConfig, s *Server) error {
 		default:
 			return fmt.Errorf("DoT needs -cert and -key, or -selfsigned")
 		}
-		tl, err := tls.Listen("tcp", cfg.DoTAddr, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		tl, err := tls.Listen("tcp", cfg.DoTAddr, dotConfig(cert))
 		if err != nil {
 			return err
 		}

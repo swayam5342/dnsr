@@ -40,8 +40,10 @@ type fakeZone struct {
 	tamper  map[string]string
 	forge   map[string]bool
 	badTCP  map[string]bool
+	noCase  bool
 	mu      sync.Mutex
 	seen    []Question
+	raw     []string
 }
 
 func a(name, ip string) RR {
@@ -115,6 +117,12 @@ func (z *fakeZone) withSigs(an []RR) []RR {
 		}
 	}
 	return an
+}
+
+func (z *fakeZone) rawNames() []string {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return append([]string(nil), z.raw...)
 }
 
 func (z *fakeZone) questions() []Question {
@@ -199,10 +207,19 @@ func startFake(t *testing.T, ip string, z *fakeZone) {
 			return nil
 		}
 		q := m.Questions[0]
+		asked := q.Name
+		q.Name = strings.ToLower(asked)
+		z.mu.Lock()
+		z.raw = append(z.raw, asked)
+		z.mu.Unlock()
 		if !udp && z.badTCP[q.Name] {
 			q.Name = "evil." + q.Name
 		}
 		out := z.answer(q, udp)
+		if !z.noCase && q.Name == strings.ToLower(asked) {
+			enc, _ := encodeName(nil, asked)
+			copy(out[12:], enc)
+		}
 		binary.BigEndian.PutUint16(out, m.Header.ID)
 		return out
 	}
@@ -213,7 +230,7 @@ func startFake(t *testing.T, ip string, z *fakeZone) {
 			if err != nil {
 				return
 			}
-			if m, err := ParseMessage(buf[:n]); err == nil && len(m.Questions) == 1 && z.forge[m.Questions[0].Name] {
+			if m, err := ParseMessage(buf[:n]); err == nil && len(m.Questions) == 1 && z.forge[strings.ToLower(m.Questions[0].Name)] {
 				q := m.Questions[0]
 				forged := buildResponse(m.Header.ID^0xFFFF, q, false, 0, []RR{a(q.Name, "6.6.6.6")}, nil, nil)
 				pc.WriteTo(forged, from)

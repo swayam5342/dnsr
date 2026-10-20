@@ -17,6 +17,7 @@ flags:
   -q        quiet: print only the final answer, no trace
   -dnssec   validate answers with DNSSEC from the root trust anchor
   -nomin    send the full name to every server (disable QNAME minimisation)
+  -no0x20   do not randomise the letter case of queries
   -nocolor  disable ANSI colours
 
 serve flags:
@@ -24,14 +25,17 @@ serve flags:
   -dot HOST:PORT       also serve DNS over TLS on this address (port 853 is standard)
   -cert FILE -key FILE TLS certificate and key for -dot
   -selfsigned          use a generated self-signed certificate for -dot
+  -allow LIST          clients allowed to query, e.g. 127.0.0.0/8,192.168.0.0/16
+                       (default: loopback only; others get REFUSED)
   -rate N -burst N     per-client query rate limit (default 20/s, burst 40)
-  -dnssec, -nomin, -trace
+  -dnssec, -nomin, -no0x20, -trace
 
 examples:
   dnsr github.com
   dnsr -t MX gmail.com
   dnsr -dnssec cloudflare.com
   dnsr serve -dnssec -dot 127.0.0.1:8853 -selfsigned
+  dnsr serve -addr 0.0.0.0:8053 -allow 127.0.0.0/8,192.168.0.0/16
 `
 
 func main() {
@@ -47,15 +51,22 @@ func main() {
 		burst := fs.Float64("burst", 40, "burst size per client")
 		dnssec := fs.Bool("dnssec", false, "validate answers with DNSSEC")
 		nomin := fs.Bool("nomin", false, "disable QNAME minimisation")
+		no0x20 := fs.Bool("no0x20", false, "disable 0x20 case randomisation")
+		allow := fs.String("allow", "", "comma-separated client networks allowed to query")
 		trace := fs.Bool("trace", false, "print full resolution trace for each query")
 		fs.Parse(os.Args[2:])
+		acl, err := ParseAllow(*allow)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: bad -allow list:", err)
+			os.Exit(2)
+		}
 		r := NewResolver()
-		r.DNSSEC, r.Minimise = *dnssec, !*nomin
+		r.DNSSEC, r.Minimise, r.CaseRandomisation = *dnssec, !*nomin, !*no0x20
 		if *trace {
 			r.Trace = os.Stderr
 		}
 		s := NewServer(r)
-		s.Rate, s.Burst = *rate, *burst
+		s.Rate, s.Burst, s.Allow = *rate, *burst, acl
 		cfg := ServeConfig{Addr: *addr, DoTAddr: *dot, CertFile: *cert, KeyFile: *key, SelfSigned: *selfSigned}
 		if err := serve(cfg, s); err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
@@ -68,6 +79,7 @@ func main() {
 	quiet := flag.Bool("q", false, "quiet")
 	dnssec := flag.Bool("dnssec", false, "validate with DNSSEC")
 	nomin := flag.Bool("nomin", false, "disable QNAME minimisation")
+	no0x20 := flag.Bool("no0x20", false, "disable 0x20 case randomisation")
 	nocolor := flag.Bool("nocolor", false, "disable colour")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -82,7 +94,7 @@ func main() {
 	}
 
 	r := NewResolver()
-	r.DNSSEC, r.Minimise = *dnssec, !*nomin
+	r.DNSSEC, r.Minimise, r.CaseRandomisation = *dnssec, !*nomin, !*no0x20
 	if !*quiet {
 		r.Trace = os.Stdout
 	}

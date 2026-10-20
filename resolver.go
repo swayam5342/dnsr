@@ -12,11 +12,12 @@ package main
 // more than the zone it serves, until the final server gets the full name.
 
 import (
+	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -74,36 +75,40 @@ type zoneEntry struct {
 }
 
 type Resolver struct {
-	Timeout         time.Duration
-	MaxHops         int
-	Trace           io.Writer
-	Port            string
-	Roots           []nameserver
-	Minimise        bool
-	DNSSEC          bool
-	Anchors         []DSRecord
-	MaxTTL          uint32
-	MaxCacheEntries int
-	color           bool
-	mu              sync.Mutex
-	cache           map[string]cacheEntry
-	zoneNS          map[string]zoneEntry
-	keys            map[string]keyEntry
+	Timeout           time.Duration
+	MaxHops           int
+	Trace             io.Writer
+	Port              string
+	Roots             []nameserver
+	Minimise          bool
+	DNSSEC            bool
+	Anchors           []DSRecord
+	MaxTTL            uint32
+	MaxCacheEntries   int
+	CaseRandomisation bool
+	color             bool
+	mu                sync.Mutex
+	cache             map[string]cacheEntry
+	zoneNS            map[string]zoneEntry
+	keys              map[string]keyEntry
+	no0x20            map[string]time.Time
 }
 
 func NewResolver() *Resolver {
 	return &Resolver{
-		Timeout:         2 * time.Second,
-		MaxHops:         40,
-		Port:            "53",
-		Roots:           rootHints,
-		Minimise:        true,
-		Anchors:         rootAnchors,
-		MaxTTL:          defaultMaxTTL,
-		MaxCacheEntries: defaultCacheSize,
-		cache:           map[string]cacheEntry{},
-		zoneNS:          map[string]zoneEntry{},
-		keys:            map[string]keyEntry{},
+		Timeout:           2 * time.Second,
+		MaxHops:           40,
+		Port:              "53",
+		Roots:             rootHints,
+		Minimise:          true,
+		Anchors:           rootAnchors,
+		MaxTTL:            defaultMaxTTL,
+		MaxCacheEntries:   defaultCacheSize,
+		CaseRandomisation: true,
+		cache:             map[string]cacheEntry{},
+		zoneNS:            map[string]zoneEntry{},
+		keys:              map[string]keyEntry{},
+		no0x20:            map[string]time.Time{},
 	}
 }
 
@@ -543,10 +548,83 @@ func matchesQuery(m *Message, id uint16, name string, qtype RRType) bool {
 		strings.EqualFold(m.Questions[0].Name, name) && m.Questions[0].Type == qtype
 }
 
-// exchange sends one query over UDP, retrying over TCP if the answer is truncated.
+var errCaseMismatch = errors.New("reply does not repeat the 0x20 letter case of the query")
+
+// randomID draws a query ID from the operating system's cryptographic random source.
+func randomID() uint16 {
+	var b [2]byte
+	crand.Read(b[:])
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// randomCase flips each letter of name to upper or lower case at random
+// (the 0x20 technique), adding one bit of entropy per letter to the query.
+func randomCase(name string) string {
+	bits := make([]byte, len(name))
+	crand.Read(bits)
+	b := []byte(name)
+	for i, c := range b {
+		if 'a' <= c|0x20 && c|0x20 <= 'z' {
+			b[i] = c&^0x20 | (bits[i]&1)<<5
+		}
+	}
+	return string(b)
+}
+
+// lowerNames normalises the names in an accepted reply, so that the random
+// letter case of the query never reaches the caches or the output.
+func lowerNames(m *Message) {
+	for i := range m.Questions {
+		m.Questions[i].Name = strings.ToLower(m.Questions[i].Name)
+	}
+	for _, sec := range [][]RR{m.Answers, m.Authority, m.Additional} {
+		for i := range sec {
+			sec[i].Name = strings.ToLower(sec[i].Name)
+			switch sec[i].Type {
+			case TypeNS, TypeCNAME, TypePTR, TypeMX, TypeSOA:
+				sec[i].Data = strings.ToLower(sec[i].Data)
+			}
+		}
+	}
+}
+
+func (r *Resolver) caseUnsafe(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.no0x20[ip]
+	return ok && time.Now().Before(t)
+}
+
+func (r *Resolver) markCaseUnsafe(ip string) {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	evict(r.no0x20, r.MaxCacheEntries, func(t time.Time) bool { return now.After(t) })
+	r.no0x20[ip] = now.Add(time.Hour)
+}
+
+// exchange sends one query, with 0x20 case randomisation unless the server is
+// known not to preserve case. A server that answers with different case is
+// remembered for an hour and asked again without 0x20.
 func (r *Resolver) exchange(ip, name string, qtype RRType) (*Message, error) {
-	id := uint16(rand.Uint32())
-	q, err := BuildQuery(id, name, qtype, r.DNSSEC)
+	mixed := r.CaseRandomisation && !r.caseUnsafe(ip)
+	m, err := r.exchangeOnce(ip, name, qtype, mixed)
+	if errors.Is(err, errCaseMismatch) {
+		r.tracef(0, "%s %s does not preserve letter case, retrying without 0x20", r.c(cYellow, "!"), ip)
+		r.markCaseUnsafe(ip)
+		m, err = r.exchangeOnce(ip, name, qtype, false)
+	}
+	return m, err
+}
+
+// exchangeOnce sends one query over UDP, retrying over TCP if the answer is truncated.
+func (r *Resolver) exchangeOnce(ip, name string, qtype RRType, mixed bool) (*Message, error) {
+	sent := name
+	if mixed {
+		sent = randomCase(name)
+	}
+	id := randomID()
+	q, err := BuildQuery(id, sent, qtype, r.DNSSEC)
 	if err != nil {
 		return nil, err
 	}
@@ -568,19 +646,23 @@ func (r *Resolver) exchange(ip, name string, qtype RRType) (*Message, error) {
 			return nil, err
 		}
 		m, err := ParseMessage(buf[:n])
-		if err != nil || !matchesQuery(m, id, name, qtype) {
+		if err != nil || !matchesQuery(m, id, sent, qtype) {
 			continue
+		}
+		if mixed && m.Questions[0].Name != sent {
+			return nil, errCaseMismatch
 		}
 		if m.Header.TC {
 			r.tracef(0, "%s response truncated, retrying over TCP", r.c(cYellow, "⇄"))
-			return exchangeTCP(addr, q, id, name, qtype, r.Timeout)
+			return exchangeTCP(addr, q, id, sent, qtype, r.Timeout, mixed)
 		}
+		lowerNames(m)
 		return m, nil
 	}
 }
 
 // DNS over TCP: same message, prefixed with a 2-byte length (RFC 1035 §4.2.2).
-func exchangeTCP(addr string, q []byte, id uint16, name string, qtype RRType, timeout time.Duration) (*Message, error) {
+func exchangeTCP(addr string, q []byte, id uint16, name string, qtype RRType, timeout time.Duration, mixed bool) (*Message, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -606,6 +688,10 @@ func exchangeTCP(addr string, q []byte, id uint16, name string, qtype RRType, ti
 	if !matchesQuery(m, id, name, qtype) {
 		return nil, errors.New("TCP reply does not match the query (ID or question)")
 	}
+	if mixed && m.Questions[0].Name != name {
+		return nil, errCaseMismatch
+	}
+	lowerNames(m)
 	return m, nil
 }
 
