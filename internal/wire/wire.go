@@ -1,18 +1,17 @@
-package main
-
-// wire.go — RFC 1035 message format, hand-rolled. No net/dns helpers.
+// Package wire is the RFC 1035 message format, hand-rolled. No net/dns helpers.
 //
-//   +---------------------+
-//   |        Header       |  12 bytes: ID, flags, 4 counts
-//   +---------------------+
-//   |       Question      |  QNAME QTYPE QCLASS
-//   +---------------------+
-//   |        Answer       |  RRs
-//   +---------------------+
-//   |      Authority      |  RRs (NS records on a referral)
-//   +---------------------+
-//   |      Additional     |  RRs (glue A/AAAA for those NS)
-//   +---------------------+
+//	+---------------------+
+//	|        Header       |  12 bytes: ID, flags, 4 counts
+//	+---------------------+
+//	|       Question      |  QNAME QTYPE QCLASS
+//	+---------------------+
+//	|        Answer       |  RRs
+//	+---------------------+
+//	|      Authority      |  RRs (NS records on a referral)
+//	+---------------------+
+//	|      Additional     |  RRs (glue A/AAAA for those NS)
+//	+---------------------+
+package wire
 
 import (
 	"encoding/base64"
@@ -76,7 +75,7 @@ const (
 
 var rcodeNames = []string{"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"}
 
-func rcodeString(r int) string {
+func RcodeString(r int) string {
 	if r < len(rcodeNames) {
 		return rcodeNames[r]
 	}
@@ -134,54 +133,11 @@ type Message struct {
 	EDNS       *EDNS
 }
 
-func encodeName(buf []byte, name string) ([]byte, error) {
-	name = strings.TrimSuffix(name, ".")
-	if name != "" {
-		for label := range strings.SplitSeq(name, ".") {
-			if len(label) == 0 || len(label) > 63 {
-				return nil, fmt.Errorf("bad label %q in %q", label, name)
-			}
-			buf = append(buf, byte(len(label)))
-			buf = append(buf, label...)
-		}
-	}
-	return append(buf, 0), nil
-}
-
-// BuildQuery makes a non-recursive query (RD=0) with an EDNS0 OPT record
-// advertising a 1232-byte UDP buffer (the DNS Flag Day 2020 value).
-// With dnssec set, the DO bit asks servers to include RRSIG records.
-func BuildQuery(id uint16, name string, qtype RRType, dnssec bool) ([]byte, error) {
-	b := make([]byte, 12, 512)
-	binary.BigEndian.PutUint16(b[0:], id)
-	binary.BigEndian.PutUint16(b[2:], 0)
-	binary.BigEndian.PutUint16(b[4:], 1)
-	binary.BigEndian.PutUint16(b[10:], 1)
-
-	var err error
-	if b, err = encodeName(b, name); err != nil {
-		return nil, err
-	}
-	b = binary.BigEndian.AppendUint16(b, uint16(qtype))
-	b = binary.BigEndian.AppendUint16(b, 1)
-
-	b = append(b, 0)
-	b = binary.BigEndian.AppendUint16(b, uint16(TypeOPT))
-	b = binary.BigEndian.AppendUint16(b, 1232)
-	var ext uint32
-	if dnssec {
-		ext = 0x8000
-	}
-	b = binary.BigEndian.AppendUint32(b, ext)
-	b = binary.BigEndian.AppendUint16(b, 0)
-	return b, nil
-}
-
 var errShort = errors.New("message truncated")
 
-// readName decodes a possibly-compressed name starting at off.
+// ReadName decodes a possibly-compressed name starting at off.
 // Returns the name and the offset just past it in the *original* stream.
-func readName(msg []byte, off int) (string, int, error) {
+func ReadName(msg []byte, off int) (string, int, error) {
 	var labels []string
 	end, total := -1, 1
 	for jumps := 0; ; {
@@ -226,7 +182,7 @@ func readName(msg []byte, off int) (string, int, error) {
 func readRR(msg []byte, off int) (RR, int, error) {
 	var rr RR
 	var err error
-	if rr.Name, off, err = readName(msg, off); err != nil {
+	if rr.Name, off, err = ReadName(msg, off); err != nil {
 		return rr, 0, err
 	}
 	if off+10 > len(msg) {
@@ -253,18 +209,18 @@ func readRR(msg []byte, off int) (RR, int, error) {
 			rr.Data = net.IP(rd).String()
 		}
 	case TypeNS, TypeCNAME, TypePTR:
-		rr.Data, _, err = readName(msg, off)
+		rr.Data, _, err = ReadName(msg, off)
 	case TypeMX:
 		if rdlen >= 3 {
 			var host string
-			host, _, err = readName(msg, off+2)
+			host, _, err = ReadName(msg, off+2)
 			rr.Data = fmt.Sprintf("%d %s", binary.BigEndian.Uint16(rd), host)
 		}
 	case TypeSOA:
 		var mname, rname string
 		var p int
-		if mname, p, err = readName(msg, off); err == nil {
-			if rname, p, err = readName(msg, p); err == nil && p+20 <= off+rdlen {
+		if mname, p, err = ReadName(msg, off); err == nil {
+			if rname, p, err = ReadName(msg, p); err == nil && p+20 <= off+rdlen {
 				rr.Data = fmt.Sprintf("%s %s %d %d %d %d %d", mname, rname,
 					binary.BigEndian.Uint32(msg[p:]), binary.BigEndian.Uint32(msg[p+4:]),
 					binary.BigEndian.Uint32(msg[p+8:]), binary.BigEndian.Uint32(msg[p+12:]),
@@ -292,7 +248,7 @@ func readRR(msg []byte, off int) (RR, int, error) {
 			rr.Data = fmt.Sprintf("%d %d %d %s", binary.BigEndian.Uint16(rd), rd[2], rd[3], base64.StdEncoding.EncodeToString(rd[4:]))
 		}
 	case TypeRRSIG:
-		if s, perr := parseRRSIG(rd); perr == nil {
+		if s, perr := ParseRRSIG(rd); perr == nil {
 			ts := func(v uint32) string { return time.Unix(int64(v), 0).UTC().Format("20060102150405") }
 			rr.Data = fmt.Sprintf("%s %d %d %d %s %s %d %s %s", s.TypeCovered, s.Algorithm, s.Labels, s.OrigTTL,
 				ts(s.Expiration), ts(s.Inception), s.KeyTag, s.Signer, base64.StdEncoding.EncodeToString(s.Signature))
@@ -330,7 +286,7 @@ func ParseMessage(msg []byte) (*Message, error) {
 	}
 	off := 12
 	for i := 0; i < int(m.Header.QDCount); i++ {
-		name, p, err := readName(msg, off)
+		name, p, err := ReadName(msg, off)
 		if err != nil {
 			return nil, err
 		}

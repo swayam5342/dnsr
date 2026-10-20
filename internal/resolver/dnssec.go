@@ -1,4 +1,4 @@
-package main
+package resolver
 
 // dnssec.go — DNSSEC validation of positive answers (RFC 4033–4035):
 //
@@ -26,9 +26,11 @@ import (
 	"fmt"
 	"hash"
 	"math/big"
-	"sort"
 	"strings"
 	"time"
+
+	"github.com/swayam5342/dnsr/internal/term"
+	"github.com/swayam5342/dnsr/internal/wire"
 )
 
 type Security int
@@ -44,14 +46,6 @@ func (s Security) String() string {
 	return [...]string{"unchecked", "insecure", "secure", "bogus"}[s]
 }
 
-type DSRecord struct {
-	Owner      string
-	KeyTag     uint16
-	Algorithm  uint8
-	DigestType uint8
-	Digest     []byte
-}
-
 func mustHex(s string) []byte {
 	b, err := hex.DecodeString(s)
 	if err != nil {
@@ -61,87 +55,9 @@ func mustHex(s string) []byte {
 }
 
 // IANA root trust anchors (root-anchors.xml): KSK-2017 and KSK-2024.
-var rootAnchors = []DSRecord{
-	{".", 20326, 8, 2, mustHex("E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D")},
-	{".", 38696, 8, 2, mustHex("683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16")},
-}
-
-type rrsig struct {
-	TypeCovered RRType
-	Algorithm   uint8
-	Labels      uint8
-	OrigTTL     uint32
-	Expiration  uint32
-	Inception   uint32
-	KeyTag      uint16
-	Signer      string
-	Signature   []byte
-}
-
-// parseRRSIG decodes RRSIG RDATA; the signer name is never compressed (RFC 4034 §3.1.7).
-func parseRRSIG(rd []byte) (*rrsig, error) {
-	if len(rd) < 19 {
-		return nil, errShort
-	}
-	be16, be32 := binary.BigEndian.Uint16, binary.BigEndian.Uint32
-	s := &rrsig{TypeCovered: RRType(be16(rd)), Algorithm: rd[2], Labels: rd[3], OrigTTL: be32(rd[4:]),
-		Expiration: be32(rd[8:]), Inception: be32(rd[12:]), KeyTag: be16(rd[16:])}
-	name, end, err := readName(rd, 18)
-	if err != nil {
-		return nil, err
-	}
-	s.Signer, s.Signature = strings.ToLower(name), rd[end:]
-	return s, nil
-}
-
-// prefix is the RRSIG RDATA without the signature, the first part of the signed data.
-func (s *rrsig) prefix() []byte {
-	b := binary.BigEndian.AppendUint16(nil, uint16(s.TypeCovered))
-	b = append(b, s.Algorithm, s.Labels)
-	b = binary.BigEndian.AppendUint32(b, s.OrigTTL)
-	b = binary.BigEndian.AppendUint32(b, s.Expiration)
-	b = binary.BigEndian.AppendUint32(b, s.Inception)
-	b = binary.BigEndian.AppendUint16(b, s.KeyTag)
-	b, _ = encodeName(b, strings.ToLower(s.Signer))
-	return b
-}
-
-type dnskey struct {
-	Owner     string
-	Flags     uint16
-	Algorithm uint8
-	Key       []byte
-	Raw       []byte
-	Tag       uint16
-}
-
-func parseDNSKEY(rr RR) (*dnskey, error) {
-	if len(rr.Raw) < 5 || rr.Raw[2] != 3 {
-		return nil, errors.New("malformed DNSKEY")
-	}
-	return &dnskey{Owner: strings.ToLower(rr.Name), Flags: binary.BigEndian.Uint16(rr.Raw), Algorithm: rr.Raw[3],
-		Key: rr.Raw[4:], Raw: rr.Raw, Tag: keyTag(rr.Raw)}, nil
-}
-
-func parseDS(rr RR) (DSRecord, error) {
-	if len(rr.Raw) < 5 {
-		return DSRecord{}, errors.New("malformed DS")
-	}
-	return DSRecord{strings.ToLower(rr.Name), binary.BigEndian.Uint16(rr.Raw), rr.Raw[2], rr.Raw[3], rr.Raw[4:]}, nil
-}
-
-// keyTag is the 16-bit checksum of DNSKEY RDATA (RFC 4034 Appendix B).
-func keyTag(rd []byte) uint16 {
-	var ac uint32
-	for i, b := range rd {
-		if i&1 == 0 {
-			ac += uint32(b) << 8
-		} else {
-			ac += uint32(b)
-		}
-	}
-	ac += ac >> 16 & 0xFFFF
-	return uint16(ac)
+var rootAnchors = []wire.DS{
+	{Owner: ".", KeyTag: 20326, Algorithm: 8, DigestType: 2, Digest: mustHex("E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D")},
+	{Owner: ".", KeyTag: 38696, Algorithm: 8, DigestType: 2, Digest: mustHex("683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16")},
 }
 
 func supportedAlgorithm(a uint8) bool { return a == 8 || a == 10 || a == 13 || a == 14 || a == 15 }
@@ -159,7 +75,7 @@ func digester(t uint8) hash.Hash {
 }
 
 // dsMatches checks that a DS record is the digest of this DNSKEY (RFC 4034 §5.1.4).
-func dsMatches(ds DSRecord, k *dnskey) bool {
+func dsMatches(ds wire.DS, k *wire.DNSKEY) bool {
 	if ds.KeyTag != k.Tag || ds.Algorithm != k.Algorithm || !strings.EqualFold(ds.Owner, k.Owner) {
 		return false
 	}
@@ -167,68 +83,10 @@ func dsMatches(ds DSRecord, k *dnskey) bool {
 	if h == nil {
 		return false
 	}
-	owner, _ := encodeName(nil, k.Owner)
+	owner, _ := wire.EncodeName(nil, k.Owner)
 	h.Write(owner)
 	h.Write(k.Raw)
 	return bytes.Equal(h.Sum(nil), ds.Digest)
-}
-
-// canonicalRData is the RDATA in canonical form: names uncompressed and lower-case (RFC 4034 §6.2).
-func canonicalRData(rr RR) ([]byte, error) {
-	switch rr.Type {
-	case TypeNS, TypeCNAME, TypePTR, TypeMX, TypeSOA:
-		rr.Data = strings.ToLower(rr.Data)
-		return encodeRData(rr)
-	}
-	return rr.Raw, nil
-}
-
-// labelCount counts labels for the RRSIG Labels field, ignoring a leading "*".
-func labelCount(name string) int {
-	ls := splitLabels(name)
-	if len(ls) > 0 && ls[0] == "*" {
-		return len(ls) - 1
-	}
-	return len(ls)
-}
-
-// signedData builds the bytes an RRSIG signs: its own fields followed by the
-// RRset in canonical form and order (RFC 4034 §3.1.8.1, §6.3).
-func signedData(s *rrsig, set []RR) ([]byte, error) {
-	owner := strings.ToLower(set[0].Name)
-	if n := labelCount(owner); int(s.Labels) < n {
-		ls := splitLabels(owner)
-		owner = "*." + strings.Join(ls[len(ls)-int(s.Labels):], ".") + "."
-		if s.Labels == 0 {
-			owner = "*."
-		}
-	}
-	ow, err := encodeName(nil, owner)
-	if err != nil {
-		return nil, err
-	}
-	var rds [][]byte
-	for _, rr := range set {
-		rd, err := canonicalRData(rr)
-		if err != nil {
-			return nil, err
-		}
-		rds = append(rds, rd)
-	}
-	sort.Slice(rds, func(i, j int) bool { return bytes.Compare(rds[i], rds[j]) < 0 })
-	out := s.prefix()
-	for i, rd := range rds {
-		if i > 0 && bytes.Equal(rd, rds[i-1]) {
-			continue
-		}
-		out = append(out, ow...)
-		out = binary.BigEndian.AppendUint16(out, uint16(set[0].Type))
-		out = binary.BigEndian.AppendUint16(out, set[0].Class)
-		out = binary.BigEndian.AppendUint32(out, s.OrigTTL)
-		out = binary.BigEndian.AppendUint16(out, uint16(len(rd)))
-		out = append(out, rd...)
-	}
-	return out, nil
 }
 
 // rsaPublicKey decodes the RFC 3110 key format: exponent length, exponent, modulus.
@@ -250,7 +108,7 @@ func rsaPublicKey(k []byte) (*rsa.PublicKey, error) {
 var errBadSignature = errors.New("signature does not verify")
 
 // verifySignature checks one RRSIG against one DNSKEY for the supported algorithms.
-func verifySignature(s *rrsig, k *dnskey, data []byte) error {
+func verifySignature(s *wire.RRSIG, k *wire.DNSKEY, data []byte) error {
 	switch k.Algorithm {
 	case 8, 10:
 		pub, err := rsaPublicKey(k.Key)
@@ -299,7 +157,7 @@ func verifySignature(s *rrsig, k *dnskey, data []byte) error {
 }
 
 // checkValidity applies the inception/expiration window using serial-number arithmetic (RFC 1982).
-func checkValidity(s *rrsig, now time.Time) error {
+func checkValidity(s *wire.RRSIG, now time.Time) error {
 	t := uint32(now.Unix())
 	if int32(t-s.Inception) < 0 {
 		return errors.New("signature not yet valid")
@@ -311,20 +169,20 @@ func checkValidity(s *rrsig, now time.Time) error {
 }
 
 // verifyRRset succeeds if any RRSIG made by zone with one of keys verifies the RRset.
-func verifyRRset(set, sigs []RR, keys []*dnskey, zone string) error {
+func verifyRRset(set, sigs []wire.RR, keys []*wire.DNSKEY, zone string) error {
 	t := set[0].Type
 	lastErr := fmt.Errorf("no RRSIG from %s for %s %s", zone, set[0].Name, t)
 	for _, sr := range sigs {
-		s, err := parseRRSIG(sr.Raw)
+		s, err := wire.ParseRRSIG(sr.Raw)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if s.TypeCovered != t || !strings.EqualFold(sr.Name, set[0].Name) || s.Signer != zone ||
-			!isSubdomain(strings.ToLower(set[0].Name), s.Signer) {
+			!wire.IsSubdomain(strings.ToLower(set[0].Name), s.Signer) {
 			continue
 		}
-		if int(s.Labels) > labelCount(set[0].Name) {
+		if int(s.Labels) > wire.LabelCount(set[0].Name) {
 			lastErr = errors.New("RRSIG labels field larger than the owner name")
 			continue
 		}
@@ -332,7 +190,7 @@ func verifyRRset(set, sigs []RR, keys []*dnskey, zone string) error {
 			lastErr = err
 			continue
 		}
-		data, err := signedData(s, set)
+		data, err := wire.SignedData(s, set)
 		if err != nil {
 			return err
 		}
@@ -351,7 +209,7 @@ func verifyRRset(set, sigs []RR, keys []*dnskey, zone string) error {
 }
 
 type keyEntry struct {
-	keys    []*dnskey
+	keys    []*wire.DNSKEY
 	sec     Security
 	why     string
 	expires time.Time
@@ -359,7 +217,7 @@ type keyEntry struct {
 
 // zoneKeys returns the validated zone-signing keys of zone, walking the chain
 // of DS and DNSKEY records up to the root trust anchor.
-func (r *Resolver) zoneKeys(zone string, depth int) ([]*dnskey, Security, string) {
+func (r *Resolver) zoneKeys(zone string, depth int) ([]*wire.DNSKEY, Security, string) {
 	if depth > 16 {
 		return nil, SecBogus, "chain of trust too deep"
 	}
@@ -381,23 +239,23 @@ func (r *Resolver) zoneKeys(zone string, depth int) ([]*dnskey, Security, string
 	return keys, sec, why
 }
 
-func (r *Resolver) fetchZoneKeys(zone string, depth int) ([]*dnskey, Security, string, uint32) {
-	var dss []DSRecord
+func (r *Resolver) fetchZoneKeys(zone string, depth int) ([]*wire.DNSKEY, Security, string, uint32) {
+	var dss []wire.DS
 	if zone == "." {
 		dss = r.Anchors
 	} else {
-		res, err := r.resolve(zone, TypeDS, 1, 0)
+		res, err := r.resolve(zone, wire.TypeDS, 1, 0)
 		if err != nil {
 			return nil, SecBogus, fmt.Sprintf("cannot fetch DS for %s: %v", zone, err), 60
 		}
-		dsSet := filterType(res.Answers, TypeDS)
-		if res.Rcode != RcodeNoError || len(dsSet) == 0 {
-			r.tracef(1, "%s no DS for %s at its parent — unsigned delegation", r.c(cYellow, "»"), zone)
+		dsSet := filterType(res.Answers, wire.TypeDS)
+		if res.Rcode != wire.RcodeNoError || len(dsSet) == 0 {
+			r.tracef(1, "%s no DS for %s at its parent — unsigned delegation", r.c(term.Yellow, "»"), zone)
 			return nil, SecInsecure, fmt.Sprintf("no DS record for %s (unsigned delegation)", zone), 300
 		}
 		parent := dsSet[0].Zone
-		for _, sr := range coveredSigs(res.Sigs, TypeDS) {
-			if s, err := parseRRSIG(sr.Raw); err == nil && s.Signer != zone && isSubdomain(zone, s.Signer) {
+		for _, sr := range coveredSigs(res.Sigs, wire.TypeDS) {
+			if s, err := wire.ParseRRSIG(sr.Raw); err == nil && s.Signer != zone && wire.IsSubdomain(zone, s.Signer) {
 				parent = s.Signer
 				break
 			}
@@ -410,27 +268,27 @@ func (r *Resolver) fetchZoneKeys(zone string, depth int) ([]*dnskey, Security, s
 			return nil, SecBogus, fmt.Sprintf("DS for %s: %v", zone, err), 60
 		}
 		for _, rr := range dsSet {
-			if ds, err := parseDS(rr); err == nil && supportedAlgorithm(ds.Algorithm) && digester(ds.DigestType) != nil {
+			if ds, err := wire.ParseDS(rr); err == nil && supportedAlgorithm(ds.Algorithm) && digester(ds.DigestType) != nil {
 				dss = append(dss, ds)
 			}
 		}
 		if len(dss) == 0 {
 			return nil, SecInsecure, fmt.Sprintf("%s uses only unsupported DNSSEC algorithms", zone), 300
 		}
-		r.tracef(1, "%s DS for %s verified with the keys of %s", r.c(cGreen, "»"), zone, parent)
+		r.tracef(1, "%s DS for %s verified with the keys of %s", r.c(term.Green, "»"), zone, parent)
 	}
 
-	res, err := r.resolve(zone, TypeDNSKEY, 1, 0)
+	res, err := r.resolve(zone, wire.TypeDNSKEY, 1, 0)
 	if err != nil {
 		return nil, SecBogus, fmt.Sprintf("cannot fetch DNSKEY for %s: %v", zone, err), 60
 	}
-	keyRRs := filterType(res.Answers, TypeDNSKEY)
+	keyRRs := filterType(res.Answers, wire.TypeDNSKEY)
 	if len(keyRRs) == 0 {
 		return nil, SecBogus, fmt.Sprintf("%s has a DS record but no DNSKEY", zone), 60
 	}
-	var all, trusted, zsks []*dnskey
+	var all, trusted, zsks []*wire.DNSKEY
 	for _, rr := range keyRRs {
-		k, err := parseDNSKEY(rr)
+		k, err := wire.ParseDNSKEY(rr)
 		if err != nil || k.Flags&0x0100 == 0 {
 			continue
 		}
@@ -449,12 +307,12 @@ func (r *Resolver) fetchZoneKeys(zone string, depth int) ([]*dnskey, Security, s
 		return nil, SecBogus, fmt.Sprintf("DNSKEY set of %s: %v", zone, err), 60
 	}
 	zsks = all
-	r.tracef(1, "%s DNSKEY set of %s verified (%d keys, signed by key %d)", r.c(cGreen, "»"), zone, len(zsks), trusted[0].Tag)
+	r.tracef(1, "%s DNSKEY set of %s verified (%d keys, signed by key %d)", r.c(term.Green, "»"), zone, len(zsks), trusted[0].Tag)
 	return zsks, SecSecure, "", minTTL(keyRRs)
 }
 
-func filterType(rrs []RR, t RRType) []RR {
-	var out []RR
+func filterType(rrs []wire.RR, t wire.RRType) []wire.RR {
+	var out []wire.RR
 	for _, rr := range rrs {
 		if rr.Type == t {
 			out = append(out, rr)
@@ -465,15 +323,15 @@ func filterType(rrs []RR, t RRType) []RR {
 
 // validateResult checks every RRset of a positive answer; the weakest result wins.
 func (r *Resolver) validateResult(res *Result) (Security, string) {
-	if res.Rcode != RcodeNoError || len(res.Answers) == 0 {
+	if res.Rcode != wire.RcodeNoError || len(res.Answers) == 0 {
 		return SecUnchecked, "negative answers are not validated (NSEC/NSEC3 not implemented)"
 	}
 	type key struct {
 		owner string
-		t     RRType
+		t     wire.RRType
 	}
 	var order []key
-	sets := map[key][]RR{}
+	sets := map[key][]wire.RR{}
 	for _, rr := range res.Answers {
 		k := key{strings.ToLower(rr.Name), rr.Type}
 		if _, ok := sets[k]; !ok {
@@ -484,7 +342,7 @@ func (r *Resolver) validateResult(res *Result) (Security, string) {
 	overall, note := SecSecure, "chain of trust verified from the root key"
 	for _, k := range order {
 		set := sets[k]
-		var sigs []RR
+		var sigs []wire.RR
 		for _, s := range coveredSigs(res.Sigs, k.t) {
 			if strings.EqualFold(s.Name, k.owner) {
 				sigs = append(sigs, s)
@@ -492,7 +350,7 @@ func (r *Resolver) validateResult(res *Result) (Security, string) {
 		}
 		zone := set[0].Zone
 		for _, sr := range sigs {
-			if s, err := parseRRSIG(sr.Raw); err == nil && isSubdomain(k.owner, s.Signer) {
+			if s, err := wire.ParseRRSIG(sr.Raw); err == nil && wire.IsSubdomain(k.owner, s.Signer) {
 				zone = s.Signer
 				break
 			}
@@ -518,10 +376,10 @@ func (r *Resolver) validateResult(res *Result) (Security, string) {
 func (r *Resolver) traceSecurity(res *Result) {
 	switch res.Security {
 	case SecSecure:
-		r.tracef(0, "%s %s", r.c(cGreen, "» DNSSEC: secure"), res.SecurityNote)
+		r.tracef(0, "%s %s", r.c(term.Green, "» DNSSEC: secure"), res.SecurityNote)
 	case SecBogus:
-		r.tracef(0, "%s %s", r.c(cRed, "» DNSSEC: BOGUS"), res.SecurityNote)
+		r.tracef(0, "%s %s", r.c(term.Red, "» DNSSEC: BOGUS"), res.SecurityNote)
 	default:
-		r.tracef(0, "%s %s", r.c(cYellow, "» DNSSEC: "+res.Security.String()), res.SecurityNote)
+		r.tracef(0, "%s %s", r.c(term.Yellow, "» DNSSEC: "+res.Security.String()), res.SecurityNote)
 	}
 }

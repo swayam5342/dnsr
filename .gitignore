@@ -1,4 +1,6 @@
 dnsr.exe
-Assessment-8.docx
+report/Assessment-8.docx
 
 *.docx
+/bin/
+/scripts/out/

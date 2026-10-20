@@ -4,6 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/swayam5342/dnsr/internal/resolver"
+	"github.com/swayam5342/dnsr/internal/server"
+	"github.com/swayam5342/dnsr/internal/term"
+	"github.com/swayam5342/dnsr/internal/wire"
 )
 
 const usage = `dnsr — an iterative DNS resolver built from scratch
@@ -40,38 +45,7 @@ examples:
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
-		fs := flag.NewFlagSet("serve", flag.ExitOnError)
-		fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
-		addr := fs.String("addr", "127.0.0.1:8053", "UDP and TCP listen address")
-		dot := fs.String("dot", "", "DNS over TLS listen address")
-		cert := fs.String("cert", "", "TLS certificate file")
-		key := fs.String("key", "", "TLS key file")
-		selfSigned := fs.Bool("selfsigned", false, "generate a self-signed certificate")
-		rate := fs.Float64("rate", 20, "queries per second per client")
-		burst := fs.Float64("burst", 40, "burst size per client")
-		dnssec := fs.Bool("dnssec", false, "validate answers with DNSSEC")
-		nomin := fs.Bool("nomin", false, "disable QNAME minimisation")
-		no0x20 := fs.Bool("no0x20", false, "disable 0x20 case randomisation")
-		allow := fs.String("allow", "", "comma-separated client networks allowed to query")
-		trace := fs.Bool("trace", false, "print full resolution trace for each query")
-		fs.Parse(os.Args[2:])
-		acl, err := ParseAllow(*allow)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "serve: bad -allow list:", err)
-			os.Exit(2)
-		}
-		r := NewResolver()
-		r.DNSSEC, r.Minimise, r.CaseRandomisation = *dnssec, !*nomin, !*no0x20
-		if *trace {
-			r.Trace = os.Stderr
-		}
-		s := NewServer(r)
-		s.Rate, s.Burst, s.Allow = *rate, *burst, acl
-		cfg := ServeConfig{Addr: *addr, DoTAddr: *dot, CertFile: *cert, KeyFile: *key, SelfSigned: *selfSigned}
-		if err := serve(cfg, s); err != nil {
-			fmt.Fprintln(os.Stderr, "serve:", err)
-			os.Exit(1)
-		}
+		serve(os.Args[2:])
 		return
 	}
 
@@ -87,51 +61,87 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	qtype, err := ParseType(*qt)
+	qtype, err := wire.ParseType(*qt)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 
-	r := NewResolver()
+	r := resolver.New()
 	r.DNSSEC, r.Minimise, r.CaseRandomisation = *dnssec, !*nomin, !*no0x20
 	if !*quiet {
 		r.Trace = os.Stdout
 	}
 	if fi, _ := os.Stdout.Stat(); !*nocolor && fi != nil && fi.Mode()&os.ModeCharDevice != 0 {
-		r.color = true
+		r.Color = true
 	}
+	paint := func(code, s string) string { return term.Paint(r.Color, code, s) }
 
 	exit := 0
 	for i, name := range flag.Args() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println(r.c(cBold, fmt.Sprintf(";; resolving %s %s", printable(fqdn(name)), qtype)))
+		fmt.Println(paint(term.Bold, fmt.Sprintf(";; resolving %s %s", term.Printable(wire.Fqdn(name)), qtype)))
 		res, err := r.Resolve(name, qtype)
 		if err != nil {
-			fmt.Println(r.c(cRed, ";; error: "+err.Error()))
+			fmt.Println(paint(term.Red, ";; error: "+err.Error()))
 			exit = 1
 			continue
 		}
-		if res.Security == SecBogus {
-			fmt.Println(r.c(cRed, ";; SERVFAIL · DNSSEC validation failed: "+res.SecurityNote))
+		if res.Security == resolver.SecBogus {
+			fmt.Println(paint(term.Red, ";; SERVFAIL · DNSSEC validation failed: "+res.SecurityNote))
 			exit = 1
 			continue
 		}
 		sec := ""
-		if res.Security != SecUnchecked {
+		if res.Security != resolver.SecUnchecked {
 			sec = " · " + res.Security.String()
 		}
-		fmt.Printf("\n;; %s%s · %d hops · %s\n", rcodeString(res.Rcode), sec, res.Hops, res.Elapsed.Round(1e6))
+		fmt.Printf("\n;; %s%s · %d hops · %s\n", wire.RcodeString(res.Rcode), sec, res.Hops, res.Elapsed.Round(1e6))
 		for _, rr := range res.Answers {
-			fmt.Println(printable(rr.String()))
+			fmt.Println(term.Printable(rr.String()))
 		}
 		if len(res.Answers) == 0 {
 			for _, rr := range res.Authority {
-				fmt.Println(r.c(cDim, rr.String()))
+				fmt.Println(paint(term.Dim, rr.String()))
 			}
 		}
 	}
 	os.Exit(exit)
+}
+
+func serve(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	addr := fs.String("addr", "127.0.0.1:8053", "UDP and TCP listen address")
+	dot := fs.String("dot", "", "DNS over TLS listen address")
+	cert := fs.String("cert", "", "TLS certificate file")
+	key := fs.String("key", "", "TLS key file")
+	selfSigned := fs.Bool("selfsigned", false, "generate a self-signed certificate")
+	rate := fs.Float64("rate", 20, "queries per second per client")
+	burst := fs.Float64("burst", 40, "burst size per client")
+	dnssec := fs.Bool("dnssec", false, "validate answers with DNSSEC")
+	nomin := fs.Bool("nomin", false, "disable QNAME minimisation")
+	no0x20 := fs.Bool("no0x20", false, "disable 0x20 case randomisation")
+	allow := fs.String("allow", "", "comma-separated client networks allowed to query")
+	trace := fs.Bool("trace", false, "print full resolution trace for each query")
+	fs.Parse(args)
+	acl, err := server.ParseAllow(*allow)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve: bad -allow list:", err)
+		os.Exit(2)
+	}
+	r := resolver.New()
+	r.DNSSEC, r.Minimise, r.CaseRandomisation = *dnssec, !*nomin, !*no0x20
+	if *trace {
+		r.Trace = os.Stderr
+	}
+	s := server.New(r)
+	s.Rate, s.Burst, s.Allow = *rate, *burst, acl
+	cfg := server.Config{Addr: *addr, DoTAddr: *dot, CertFile: *cert, KeyFile: *key, SelfSigned: *selfSigned}
+	if err := s.ListenAndServe(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(1)
+	}
 }
