@@ -4,6 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\demo.ps1 dnssec server # chosen sections
 #   powershell -ExecutionPolicy Bypass -File scripts\demo.ps1 -List         # list sections
 #   powershell -ExecutionPolicy Bypass -File scripts\demo.ps1 -Pause        # wait for Enter between sections
+#   powershell -ExecutionPolicy Bypass -File scripts\demo.ps1 -NoGo         # hide the Go toolchain (build quietly, skip tests/fuzz/bench)
 #
 # The live sections need outbound UDP/TCP port 53 to the internet; the test,
 # fuzz and bench sections run fully offline.
@@ -11,7 +12,8 @@
 param(
     [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Sections,
     [switch] $List,
-    [switch] $Pause
+    [switch] $Pause,
+    [switch] $NoGo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +42,7 @@ $All = [ordered]@{
     fuzz     = 'Parser robustness: 1,000,000 random packets and native fuzzing'
     bench    = 'Benchmarks: parse, build query, ECDSA signature check'
 }
+$GoSections = 'build', 'tests', 'fuzz', 'bench'
 
 function Banner($name) {
     Write-Host ''
@@ -82,7 +85,17 @@ function Stop-Dnsr($p, [string] $log) {
 }
 
 function Need-Build {
-    if (-not (Test-Path $Dnsr) -or -not (Test-Path $Dnsq)) { Section-build }
+    if (-not (Test-Path $Dnsr) -or -not (Test-Path $Dnsq)) { if ($NoGo) { Build-Quiet } else { Section-build } }
+}
+
+function Build-Quiet {
+    Push-Location $Root
+    try {
+        foreach ($cmd in 'dnsr', 'dnsq') {
+            go build -o "bin\$cmd.exe" "./cmd/$cmd"
+            if ($LASTEXITCODE -ne 0) { throw "go build of $cmd failed" }
+        }
+    } finally { Pop-Location }
 }
 
 function Section-build {
@@ -211,10 +224,11 @@ if ($List) {
     $All.GetEnumerator() | ForEach-Object { '{0,-9} {1}' -f $_.Key, $_.Value }
     return
 }
-if (-not $Sections) { $Sections = @($All.Keys) }
+if (-not $Sections) { $Sections = @($All.Keys | Where-Object { -not ($NoGo -and $GoSections -contains $_) }) }
 foreach ($s in $Sections) {
     if (-not $All.Contains($s)) { throw "unknown section '$s' (use -List)" }
 }
+if ($NoGo) { Build-Quiet }
 $first = $true
 foreach ($s in $Sections) {
     if ($Pause -and -not $first) { Read-Host "`nPress Enter for '$s'" | Out-Null }

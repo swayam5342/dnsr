@@ -5,6 +5,7 @@
 #   ./scripts/demo.sh dnssec server   # chosen sections
 #   ./scripts/demo.sh -l              # list sections
 #   PAUSE=1 ./scripts/demo.sh         # wait for Enter between sections
+#   NOGO=1 ./scripts/demo.sh          # hide the Go toolchain (build quietly, skip tests/fuzz/bench)
 #
 # The live sections need outbound UDP/TCP port 53 to the internet; the test,
 # fuzz and bench sections run fully offline.
@@ -16,6 +17,7 @@ DNSR="$ROOT/bin/dnsr$EXE"
 DNSQ="$ROOT/bin/dnsq$EXE"
 LOGS="$ROOT/scripts/out"
 
+GO_SECTIONS=" build tests fuzz bench "
 SECTIONS=(build usage lookup types negative cache nomin glueless tcp dnssec server acl compare tests fuzz bench)
 declare -A DESC=(
   [build]="Build dnsr and the dnsq test client"
@@ -45,7 +47,11 @@ run() {
   "$@"
 }
 
-need_build() { [[ -x "$DNSR" && -x "$DNSQ" ]] || s_build; }
+need_build() { [[ -x "$DNSR" && -x "$DNSQ" ]] || { if [[ -n "${NOGO:-}" ]]; then build_quiet; else s_build; fi; }; }
+
+build_quiet() {
+  (cd "$ROOT" && go build -o "bin/dnsr$EXE" ./cmd/dnsr && go build -o "bin/dnsq$EXE" ./cmd/dnsq) || { echo "go build failed" >&2; exit 1; }
+}
 
 start_dnsr() {
   local log="$1"; shift
@@ -177,10 +183,15 @@ if [[ "${1:-}" == "-l" ]]; then
   exit 0
 fi
 chosen=("$@")
-[[ ${#chosen[@]} -eq 0 ]] && chosen=("${SECTIONS[@]}")
+if [[ ${#chosen[@]} -eq 0 ]]; then
+  for s in "${SECTIONS[@]}"; do
+    [[ -n "${NOGO:-}" && "$GO_SECTIONS" == *" $s "* ]] || chosen+=("$s")
+  done
+fi
 for s in "${chosen[@]}"; do
   [[ -n "${DESC[$s]:-}" ]] || { echo "unknown section '$s' (use -l)" >&2; exit 2; }
 done
+[[ -n "${NOGO:-}" ]] && build_quiet
 first=1
 for s in "${chosen[@]}"; do
   [[ -n "${PAUSE:-}" && $first -eq 0 ]] && read -rp $'\nPress Enter for '"'$s'" _
