@@ -8,6 +8,8 @@ package main
 // referrals (NS in Authority + glue in Additional) until someone answers
 // authoritatively. CNAMEs are chased, glueless delegations are resolved
 // with a nested lookup, and truncated UDP responses fall back to TCP.
+// Queries are QNAME-minimised (RFC 9156): each server only sees one label
+// more than the zone it serves, until the final server gets the full name.
 
 import (
 	"encoding/binary"
@@ -37,44 +39,71 @@ var rootHints = []nameserver{
 	{"m.root-servers.net.", "202.12.27.33"},
 }
 
+const (
+	defaultMaxTTL      = 86400
+	defaultCacheSize   = 10000
+	maxGluelessLookups = 3
+	maxMinimiseLabels  = 10
+)
+
 type nameserver struct {
 	Name string
 	IP   string
 }
 
 type Result struct {
-	Rcode     int
-	Answers   []RR
-	Authority []RR
-	Hops      int
-	Elapsed   time.Duration
+	Rcode        int
+	Answers      []RR
+	Authority    []RR
+	Sigs         []RR
+	Hops         int
+	Elapsed      time.Duration
+	Security     Security
+	SecurityNote string
 }
 
 type cacheEntry struct {
 	rrs     []RR
+	sigs    []RR
+	expires time.Time
+}
+
+type zoneEntry struct {
+	ns      []nameserver
 	expires time.Time
 }
 
 type Resolver struct {
-	Timeout time.Duration
-	MaxHops int
-	Trace   io.Writer
-	Port    string
-	Roots   []nameserver
-	color   bool
-	mu      sync.Mutex
-	cache   map[string]cacheEntry
-	zoneNS  map[string][]nameserver
+	Timeout         time.Duration
+	MaxHops         int
+	Trace           io.Writer
+	Port            string
+	Roots           []nameserver
+	Minimise        bool
+	DNSSEC          bool
+	Anchors         []DSRecord
+	MaxTTL          uint32
+	MaxCacheEntries int
+	color           bool
+	mu              sync.Mutex
+	cache           map[string]cacheEntry
+	zoneNS          map[string]zoneEntry
+	keys            map[string]keyEntry
 }
 
 func NewResolver() *Resolver {
 	return &Resolver{
-		Timeout: 2 * time.Second,
-		MaxHops: 40,
-		Port:    "53",
-		Roots:   rootHints,
-		cache:   map[string]cacheEntry{},
-		zoneNS:  map[string][]nameserver{},
+		Timeout:         2 * time.Second,
+		MaxHops:         40,
+		Port:            "53",
+		Roots:           rootHints,
+		Minimise:        true,
+		Anchors:         rootAnchors,
+		MaxTTL:          defaultMaxTTL,
+		MaxCacheEntries: defaultCacheSize,
+		cache:           map[string]cacheEntry{},
+		zoneNS:          map[string]zoneEntry{},
+		keys:            map[string]keyEntry{},
 	}
 }
 
@@ -99,9 +128,43 @@ func isSubdomain(child, parent string) bool {
 	return child == parent || strings.HasSuffix(child, "."+parent)
 }
 
+// splitLabels returns the labels of a name, without the root ("www.example.com." → www, example, com).
+func splitLabels(name string) []string {
+	name = strings.TrimSuffix(name, ".")
+	if name == "" {
+		return nil
+	}
+	return strings.Split(name, ".")
+}
+
+// parentName drops the leftmost label ("www.example.com." → "example.com.").
+func parentName(name string) string {
+	ls := splitLabels(name)
+	if len(ls) <= 1 {
+		return "."
+	}
+	return strings.Join(ls[1:], ".") + "."
+}
+
+// childToward returns the name one label below zone on the way to name
+// ("www.example.com." from "com." → "example.com.").
+func childToward(name, zone string) string {
+	if name == zone || !isSubdomain(name, zone) {
+		return name
+	}
+	nl, zl := splitLabels(name), len(splitLabels(zone))
+	return strings.Join(nl[len(nl)-zl-1:], ".") + "."
+}
+
+// Resolve resolves name/qtype from the root and, when DNSSEC is enabled,
+// validates the answer against the root trust anchor.
 func (r *Resolver) Resolve(name string, qtype RRType) (*Result, error) {
 	start := time.Now()
 	res, err := r.resolve(fqdn(name), qtype, 0, 0)
+	if err == nil && r.DNSSEC {
+		res.Security, res.SecurityNote = r.validateResult(res)
+		r.traceSecurity(res)
+	}
 	if res != nil {
 		res.Elapsed = time.Since(start)
 	}
@@ -116,22 +179,86 @@ func (r *Resolver) c(code, s string) string {
 	if !r.color {
 		return s
 	}
-	return code + s + cReset
+	return code + printable(s) + cReset
 }
 
+// tracef prints one trace line; control characters from untrusted names are escaped.
 func (r *Resolver) tracef(depth int, format string, a ...any) {
 	if r.Trace == nil {
 		return
 	}
+	for i, v := range a {
+		if s, ok := v.(string); ok && !strings.HasPrefix(s, "\033") {
+			a[i] = printable(s)
+		}
+	}
 	fmt.Fprintf(r.Trace, "%s%s\n", strings.Repeat("  │ ", depth), fmt.Sprintf(format, a...))
 }
 
-func (r *Resolver) cacheGet(name string, t RRType) ([]RR, bool) {
+// printable escapes bytes that could act as terminal control sequences.
+func printable(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			var b strings.Builder
+			for j := 0; j < len(s); j++ {
+				if c := s[j]; c < 0x20 || c == 0x7f {
+					fmt.Fprintf(&b, "\\%03d", c)
+				} else {
+					b.WriteByte(c)
+				}
+			}
+			return b.String()
+		}
+	}
+	return s
+}
+
+// clampTTLs caps every TTL at MaxTTL so no record can stay cached for longer.
+func (r *Resolver) clampTTLs(rrs []RR) []RR {
+	out := make([]RR, len(rrs))
+	for i, rr := range rrs {
+		if rr.TTL > r.MaxTTL {
+			rr.TTL = r.MaxTTL
+		}
+		out[i] = rr
+	}
+	return out
+}
+
+func minTTL(rrs []RR) uint32 {
+	m := rrs[0].TTL
+	for _, rr := range rrs {
+		if rr.TTL < m {
+			m = rr.TTL
+		}
+	}
+	return m
+}
+
+// evict makes room in a bounded cache: expired entries go first, then arbitrary ones.
+func evict[V any](m map[string]V, max int, expired func(V) bool) {
+	if len(m) < max {
+		return
+	}
+	for k, v := range m {
+		if expired(v) {
+			delete(m, k)
+		}
+	}
+	for k := range m {
+		if len(m) < max {
+			break
+		}
+		delete(m, k)
+	}
+}
+
+func (r *Resolver) cacheGet(name string, t RRType) ([]RR, []RR, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.cache[name+"|"+t.String()]
 	if !ok || time.Now().After(e.expires) {
-		return nil, false
+		return nil, nil, false
 	}
 	left := uint32(time.Until(e.expires).Seconds())
 	out := make([]RR, len(e.rrs))
@@ -139,91 +266,165 @@ func (r *Resolver) cacheGet(name string, t RRType) ([]RR, bool) {
 		rr.TTL = left
 		out[i] = rr
 	}
-	return out, true
+	return out, e.sigs, true
 }
 
-func (r *Resolver) cachePut(name string, t RRType, rrs []RR) {
+func (r *Resolver) cachePut(name string, t RRType, rrs, sigs []RR) {
 	if len(rrs) == 0 {
 		return
 	}
-	min := rrs[0].TTL
-	for _, rr := range rrs {
-		if rr.TTL < min {
-			min = rr.TTL
-		}
-	}
+	ttl := min(minTTL(rrs), r.MaxTTL)
+	now := time.Now()
 	r.mu.Lock()
-	r.cache[name+"|"+t.String()] = cacheEntry{rrs, time.Now().Add(time.Duration(min) * time.Second)}
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	evict(r.cache, r.MaxCacheEntries, func(e cacheEntry) bool { return now.After(e.expires) })
+	r.cache[name+"|"+t.String()] = cacheEntry{rrs, sigs, now.Add(time.Duration(ttl) * time.Second)}
+}
+
+func (r *Resolver) putZone(zone string, ns []nameserver, ttl uint32) {
+	ttl = min(ttl, r.MaxTTL)
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	evict(r.zoneNS, r.MaxCacheEntries, func(e zoneEntry) bool { return now.After(e.expires) })
+	r.zoneNS[zone] = zoneEntry{ns, now.Add(time.Duration(ttl) * time.Second)}
 }
 
 func (r *Resolver) closestKnownZone(name string) (string, []nameserver) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	for z := name; ; {
-		if ns, ok := r.zoneNS[z]; ok && len(ns) > 0 {
-			return z, ns
+		if e, ok := r.zoneNS[z]; ok && len(e.ns) > 0 && now.Before(e.expires) {
+			return z, e.ns
 		}
 		if z == "." {
 			return ".", r.Roots
 		}
-		if i := strings.IndexByte(z, '.'); i >= 0 && i+1 < len(z) {
-			z = z[i+1:]
-		} else {
-			z = "."
+		z = parentName(z)
+	}
+}
+
+// coveredSigs returns the RRSIGs that cover records of type t.
+func coveredSigs(sigs []RR, t RRType) []RR {
+	var out []RR
+	for _, s := range sigs {
+		if len(s.Raw) >= 2 && RRType(binary.BigEndian.Uint16(s.Raw)) == t {
+			out = append(out, s)
 		}
 	}
+	return out
+}
+
+// referralNS extracts the delegation from a reply: NS records in the authority
+// section, or, for a minimised NS query, NS records for qname in the answer.
+func referralNS(msg *Message, qname string, probing bool) ([]RR, string) {
+	var out []RR
+	var child string
+	if probing {
+		for _, rr := range msg.Answers {
+			if rr.Type == TypeNS && strings.EqualFold(rr.Name, qname) {
+				out, child = append(out, rr), strings.ToLower(rr.Name)
+			}
+		}
+		if len(out) > 0 {
+			return out, child
+		}
+	}
+	for _, rr := range msg.Authority {
+		if rr.Type == TypeNS {
+			out, child = append(out, rr), strings.ToLower(rr.Name)
+		}
+	}
+	return out, child
+}
+
+// unexpectedAnswer reports whether a reply to a minimised NS query contains
+// anything other than NS records for the probed name (a CNAME, for example).
+func unexpectedAnswer(msg *Message, qname string) bool {
+	for _, rr := range msg.Answers {
+		if rr.Type == TypeRRSIG {
+			continue
+		}
+		if rr.Type != TypeNS || !strings.EqualFold(rr.Name, qname) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Resolver) resolve(name string, qtype RRType, depth, hops int) (*Result, error) {
 	if depth > 8 {
 		return nil, ErrLoop
 	}
-	if rrs, ok := r.cacheGet(name, qtype); ok {
+	if rrs, sigs, ok := r.cacheGet(name, qtype); ok {
 		r.tracef(depth, "%s %s %s", r.c(cGreen, "✓ cache hit"), name, qtype)
-		return &Result{Rcode: RcodeNoError, Answers: rrs, Hops: hops}, nil
+		return &Result{Rcode: RcodeNoError, Answers: rrs, Sigs: sigs, Hops: hops}, nil
 	}
 
-	zone, servers := r.closestKnownZone(name)
+	start := name
+	if qtype == TypeDS && name != "." {
+		start = parentName(name)
+	}
+	zone, servers := r.closestKnownZone(start)
 	if zone != "." {
 		r.tracef(depth, "%s starting at cached zone %s", r.c(cDim, "↷"), r.c(cBold, zone))
 	}
+	minimise := r.Minimise && len(splitLabels(name)) <= maxMinimiseLabels
+	probe := childToward(name, zone)
 
 	for ; hops < r.MaxHops; hops++ {
-		msg, ns, rtt, err := r.queryAny(servers, name, qtype, depth)
+		qname, qt := name, qtype
+		if minimise && probe != name {
+			qname, qt = probe, TypeNS
+		}
+		probing := qname != name
+		msg, ns, rtt, err := r.queryAny(servers, qname, qt, depth)
 		if err != nil {
-			return nil, fmt.Errorf("querying %s servers for %s: %w", zone, name, err)
+			return nil, fmt.Errorf("querying %s servers for %s: %w", zone, qname, err)
 		}
-		if msg.Header.Rcode == RcodeNXDomain {
-			r.tracef(depth, "%s %s says %s (%s)", r.c(cRed, "✗"), ns.Name, r.c(cRed, "NXDOMAIN"), rtt)
-			return &Result{Rcode: RcodeNXDomain, Authority: msg.Authority, Hops: hops + 1}, nil
-		}
-		if msg.Header.Rcode != RcodeNoError {
-			r.tracef(depth, "%s %s returned %s, trying next server", r.c(cYellow, "!"), ns.Name, rcodeString(msg.Header.Rcode))
-			servers = without(servers, ns)
-			if len(servers) == 0 {
-				return &Result{Rcode: msg.Header.Rcode, Hops: hops + 1}, nil
-			}
+
+		if probing && (msg.Header.Rcode != RcodeNoError || unexpectedAnswer(msg, qname)) {
+			r.tracef(depth, "%s %s gave %s to the minimised query, asking for the full name", r.c(cYellow, "↺"), ns.Name, rcodeString(msg.Header.Rcode))
+			minimise = false
 			continue
 		}
 
-		if len(msg.Answers) > 0 {
-			var direct, cnames []RR
+		if !probing {
+			if msg.Header.Rcode == RcodeNXDomain {
+				r.tracef(depth, "%s %s says %s (%s)", r.c(cRed, "✗"), ns.Name, r.c(cRed, "NXDOMAIN"), rtt)
+				return &Result{Rcode: RcodeNXDomain, Authority: r.clampTTLs(msg.Authority), Hops: hops + 1}, nil
+			}
+			if msg.Header.Rcode != RcodeNoError {
+				r.tracef(depth, "%s %s returned %s, trying next server", r.c(cYellow, "!"), ns.Name, rcodeString(msg.Header.Rcode))
+				servers = without(servers, ns)
+				if len(servers) == 0 {
+					return &Result{Rcode: msg.Header.Rcode, Hops: hops + 1}, nil
+				}
+				continue
+			}
+
+			var direct, cnames, sigs []RR
 			for _, rr := range msg.Answers {
 				if !strings.EqualFold(rr.Name, name) {
 					continue
 				}
-				if rr.Type == qtype {
+				rr.Zone = zone
+				switch {
+				case rr.Type == qtype:
 					direct = append(direct, rr)
-				} else if rr.Type == TypeCNAME {
+				case rr.Type == TypeCNAME:
 					cnames = append(cnames, rr)
+				case rr.Type == TypeRRSIG:
+					sigs = append(sigs, rr)
 				}
 			}
 			if len(direct) > 0 {
 				r.tracef(depth, "%s %s answered %s (%s)", r.c(cGreen, "✓"), ns.Name,
 					r.c(cGreen, fmt.Sprintf("%d %s record(s)", len(direct), qtype)), rtt)
-				r.cachePut(name, qtype, direct)
-				return &Result{Rcode: RcodeNoError, Answers: direct, Hops: hops + 1}, nil
+				direct, sigs = r.clampTTLs(direct), coveredSigs(sigs, qtype)
+				r.cachePut(name, qtype, direct, sigs)
+				return &Result{Rcode: RcodeNoError, Answers: direct, Sigs: sigs, Hops: hops + 1}, nil
 			}
 			if len(cnames) > 0 {
 				target := fqdn(cnames[0].Data)
@@ -232,24 +433,23 @@ func (r *Resolver) resolve(name string, qtype RRType, depth, hops int) (*Result,
 				if err != nil {
 					return nil, err
 				}
-				sub.Answers = append([]RR{cnames[0]}, sub.Answers...)
+				sub.Answers = append(r.clampTTLs(cnames[:1]), sub.Answers...)
+				sub.Sigs = append(coveredSigs(sigs, TypeCNAME), sub.Sigs...)
 				return sub, nil
 			}
-		}
-		if msg.Header.AA {
-			r.tracef(depth, "%s %s: name exists but has no %s records (NODATA)", r.c(cYellow, "∅"), ns.Name, qtype)
-			return &Result{Rcode: RcodeNoError, Authority: msg.Authority, Hops: hops + 1}, nil
-		}
-
-		var nsRRs []RR
-		var child string
-		for _, rr := range msg.Authority {
-			if rr.Type == TypeNS {
-				nsRRs = append(nsRRs, rr)
-				child = strings.ToLower(rr.Name)
+			if msg.Header.AA {
+				r.tracef(depth, "%s %s: name exists but has no %s records (NODATA)", r.c(cYellow, "∅"), ns.Name, qtype)
+				return &Result{Rcode: RcodeNoError, Authority: r.clampTTLs(msg.Authority), Hops: hops + 1}, nil
 			}
 		}
+
+		nsRRs, child := referralNS(msg, qname, probing)
 		if len(nsRRs) == 0 {
+			if probing && msg.Header.AA {
+				r.tracef(depth, "%s %s: no zone cut at %s (%s)", r.c(cDim, "·"), ns.Name, qname, rtt)
+				probe = childToward(name, probe)
+				continue
+			}
 			return nil, fmt.Errorf("lame response from %s: no answer, no referral", ns.Name)
 		}
 
@@ -267,7 +467,11 @@ func (r *Resolver) resolve(name string, qtype RRType, depth, hops int) (*Result,
 
 		if len(next) == 0 {
 			r.tracef(depth, "%s no glue for %s — resolving a nameserver's address first", r.c(cYellow, "⋯"), child)
-			for _, nsrr := range shuffled(nsRRs) {
+			for i, nsrr := range shuffled(nsRRs) {
+				if i >= maxGluelessLookups {
+					r.tracef(depth, "%s giving up after %d nameserver lookups for %s", r.c(cYellow, "!"), maxGluelessLookups, child)
+					break
+				}
 				sub, err := r.resolve(fqdn(nsrr.Data), TypeA, depth+1, 0)
 				if err != nil || sub.Rcode != RcodeNoError {
 					continue
@@ -286,10 +490,9 @@ func (r *Resolver) resolve(name string, qtype RRType, depth, hops int) (*Result,
 			}
 		}
 
-		r.mu.Lock()
-		r.zoneNS[child] = next
-		r.mu.Unlock()
+		r.putZone(child, next, minTTL(nsRRs))
 		zone, servers = child, next
+		probe = childToward(name, zone)
 	}
 	return nil, ErrLoop
 }
@@ -333,10 +536,17 @@ func (r *Resolver) queryAny(servers []nameserver, name string, qtype RRType, dep
 	return nil, nameserver{}, 0, lastErr
 }
 
+// matchesQuery is the anti-spoofing check: a reply is only accepted if it
+// carries our ID and repeats exactly the question we asked.
+func matchesQuery(m *Message, id uint16, name string, qtype RRType) bool {
+	return m.Header.ID == id && m.Header.QR && len(m.Questions) == 1 &&
+		strings.EqualFold(m.Questions[0].Name, name) && m.Questions[0].Type == qtype
+}
+
 // exchange sends one query over UDP, retrying over TCP if the answer is truncated.
 func (r *Resolver) exchange(ip, name string, qtype RRType) (*Message, error) {
 	id := uint16(rand.Uint32())
-	q, err := BuildQuery(id, name, qtype)
+	q, err := BuildQuery(id, name, qtype, r.DNSSEC)
 	if err != nil {
 		return nil, err
 	}
@@ -358,23 +568,19 @@ func (r *Resolver) exchange(ip, name string, qtype RRType) (*Message, error) {
 			return nil, err
 		}
 		m, err := ParseMessage(buf[:n])
-		if err != nil {
-			return nil, err
-		}
-		if m.Header.ID != id || !m.Header.QR || len(m.Questions) != 1 ||
-			!strings.EqualFold(m.Questions[0].Name, name) || m.Questions[0].Type != qtype {
+		if err != nil || !matchesQuery(m, id, name, qtype) {
 			continue
 		}
 		if m.Header.TC {
 			r.tracef(0, "%s response truncated, retrying over TCP", r.c(cYellow, "⇄"))
-			return exchangeTCP(addr, q, id, r.Timeout)
+			return exchangeTCP(addr, q, id, name, qtype, r.Timeout)
 		}
 		return m, nil
 	}
 }
 
 // DNS over TCP: same message, prefixed with a 2-byte length (RFC 1035 §4.2.2).
-func exchangeTCP(addr string, q []byte, id uint16, timeout time.Duration) (*Message, error) {
+func exchangeTCP(addr string, q []byte, id uint16, name string, qtype RRType, timeout time.Duration) (*Message, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -397,8 +603,8 @@ func exchangeTCP(addr string, q []byte, id uint16, timeout time.Duration) (*Mess
 	if err != nil {
 		return nil, err
 	}
-	if m.Header.ID != id {
-		return nil, errors.New("TCP response ID mismatch")
+	if !matchesQuery(m, id, name, qtype) {
+		return nil, errors.New("TCP reply does not match the query (ID or question)")
 	}
 	return m, nil
 }

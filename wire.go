@@ -15,30 +15,38 @@ package main
 //   +---------------------+
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 type RRType uint16
 
 const (
-	TypeA     RRType = 1
-	TypeNS    RRType = 2
-	TypeCNAME RRType = 5
-	TypeSOA   RRType = 6
-	TypePTR   RRType = 12
-	TypeMX    RRType = 15
-	TypeTXT   RRType = 16
-	TypeAAAA  RRType = 28
-	TypeOPT   RRType = 41
+	TypeA      RRType = 1
+	TypeNS     RRType = 2
+	TypeCNAME  RRType = 5
+	TypeSOA    RRType = 6
+	TypePTR    RRType = 12
+	TypeMX     RRType = 15
+	TypeTXT    RRType = 16
+	TypeAAAA   RRType = 28
+	TypeOPT    RRType = 41
+	TypeDS     RRType = 43
+	TypeRRSIG  RRType = 46
+	TypeNSEC   RRType = 47
+	TypeDNSKEY RRType = 48
+	TypeNSEC3  RRType = 50
 )
 
 var typeNames = map[RRType]string{
 	TypeA: "A", TypeNS: "NS", TypeCNAME: "CNAME", TypeSOA: "SOA", TypePTR: "PTR",
 	TypeMX: "MX", TypeTXT: "TXT", TypeAAAA: "AAAA", TypeOPT: "OPT",
+	TypeDS: "DS", TypeRRSIG: "RRSIG", TypeNSEC: "NSEC", TypeDNSKEY: "DNSKEY", TypeNSEC3: "NSEC3",
 }
 
 func (t RRType) String() string {
@@ -83,6 +91,8 @@ type Header struct {
 	TC      bool
 	RD      bool
 	RA      bool
+	AD      bool
+	CD      bool
 	Rcode   int
 	QDCount uint16
 	ANCount uint16
@@ -103,10 +113,16 @@ type RR struct {
 	TTL   uint32
 	Data  string
 	Raw   []byte
+	Zone  string
 }
 
 func (r RR) String() string {
 	return fmt.Sprintf("%-28s %6d IN %-5s %s", r.Name, r.TTL, r.Type, r.Data)
+}
+
+type EDNS struct {
+	UDPSize uint16
+	DO      bool
 }
 
 type Message struct {
@@ -115,12 +131,13 @@ type Message struct {
 	Answers    []RR
 	Authority  []RR
 	Additional []RR
+	EDNS       *EDNS
 }
 
 func encodeName(buf []byte, name string) ([]byte, error) {
 	name = strings.TrimSuffix(name, ".")
 	if name != "" {
-		for _, label := range strings.Split(name, ".") {
+		for label := range strings.SplitSeq(name, ".") {
 			if len(label) == 0 || len(label) > 63 {
 				return nil, fmt.Errorf("bad label %q in %q", label, name)
 			}
@@ -133,7 +150,8 @@ func encodeName(buf []byte, name string) ([]byte, error) {
 
 // BuildQuery makes a non-recursive query (RD=0) with an EDNS0 OPT record
 // advertising a 1232-byte UDP buffer (the DNS Flag Day 2020 value).
-func BuildQuery(id uint16, name string, qtype RRType) ([]byte, error) {
+// With dnssec set, the DO bit asks servers to include RRSIG records.
+func BuildQuery(id uint16, name string, qtype RRType, dnssec bool) ([]byte, error) {
 	b := make([]byte, 12, 512)
 	binary.BigEndian.PutUint16(b[0:], id)
 	binary.BigEndian.PutUint16(b[2:], 0)
@@ -150,7 +168,11 @@ func BuildQuery(id uint16, name string, qtype RRType) ([]byte, error) {
 	b = append(b, 0)
 	b = binary.BigEndian.AppendUint16(b, uint16(TypeOPT))
 	b = binary.BigEndian.AppendUint16(b, 1232)
-	b = binary.BigEndian.AppendUint32(b, 0)
+	var ext uint32
+	if dnssec {
+		ext = 0x8000
+	}
+	b = binary.BigEndian.AppendUint32(b, ext)
 	b = binary.BigEndian.AppendUint16(b, 0)
 	return b, nil
 }
@@ -161,7 +183,7 @@ var errShort = errors.New("message truncated")
 // Returns the name and the offset just past it in the *original* stream.
 func readName(msg []byte, off int) (string, int, error) {
 	var labels []string
-	end := -1
+	end, total := -1, 1
 	for jumps := 0; ; {
 		if off >= len(msg) {
 			return "", 0, errShort
@@ -191,6 +213,9 @@ func readName(msg []byte, off int) (string, int, error) {
 			off++
 			if off+l > len(msg) {
 				return "", 0, errShort
+			}
+			if total += l + 1; total > 255 {
+				return "", 0, errors.New("name longer than 255 bytes")
 			}
 			labels = append(labels, string(msg[off:off+l]))
 			off += l
@@ -258,6 +283,20 @@ func readRR(msg []byte, off int) (RR, int, error) {
 			i += n
 		}
 		rr.Data = strings.Join(parts, " ")
+	case TypeDS:
+		if rdlen > 4 {
+			rr.Data = fmt.Sprintf("%d %d %d %X", binary.BigEndian.Uint16(rd), rd[2], rd[3], rd[4:])
+		}
+	case TypeDNSKEY:
+		if rdlen > 4 {
+			rr.Data = fmt.Sprintf("%d %d %d %s", binary.BigEndian.Uint16(rd), rd[2], rd[3], base64.StdEncoding.EncodeToString(rd[4:]))
+		}
+	case TypeRRSIG:
+		if s, perr := parseRRSIG(rd); perr == nil {
+			ts := func(v uint32) string { return time.Unix(int64(v), 0).UTC().Format("20060102150405") }
+			rr.Data = fmt.Sprintf("%s %d %d %d %s %s %d %s %s", s.TypeCovered, s.Algorithm, s.Labels, s.OrigTTL,
+				ts(s.Expiration), ts(s.Inception), s.KeyTag, s.Signer, base64.StdEncoding.EncodeToString(s.Signature))
+		}
 	default:
 		rr.Data = fmt.Sprintf("\\# %d %x", rdlen, rd)
 	}
@@ -281,6 +320,8 @@ func ParseMessage(msg []byte) (*Message, error) {
 		TC:      f&0x0200 != 0,
 		RD:      f&0x0100 != 0,
 		RA:      f&0x0080 != 0,
+		AD:      f&0x0020 != 0,
+		CD:      f&0x0010 != 0,
 		Rcode:   int(f & 0xF),
 		QDCount: binary.BigEndian.Uint16(msg[4:]),
 		ANCount: binary.BigEndian.Uint16(msg[6:]),
@@ -310,7 +351,9 @@ func ParseMessage(msg []byte) (*Message, error) {
 			if err != nil {
 				return nil, err
 			}
-			if rr.Type != TypeOPT {
+			if rr.Type == TypeOPT {
+				m.EDNS = &EDNS{UDPSize: rr.Class, DO: rr.TTL&0x8000 != 0}
+			} else {
 				*s.dst = append(*s.dst, rr)
 			}
 			off = p

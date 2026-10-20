@@ -1,3 +1,3 @@
 module github.com/swayam5342/dnsr
 
-go 1.22
+go 1.25
