@@ -1,0 +1,21 @@
+<mxfile host="app.diagrams.net" pages="1">
+  <diagram id="bail" name="Bailiwick Decisions">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="bail2" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=13;fontColor=#000000;align=left;verticalAlign=middle;fontStyle=1;" value="Server asked: a .com TLD server (current zone = com.)   Query: www.example.com A"><mxGeometry x="20" y="15" width="900" height="30" as="geometry"/></mxCell>
+        <mxCell id="bail3" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#eaf6ea;" value='&lt;span style="font-size:12px"&gt;Referral: example.com. NS ns1.example.com.&lt;/span&gt;'><mxGeometry x="20" y="60" width="400" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail4" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=12;fontColor=#1e6b1e;align=left;verticalAlign=middle;fontStyle=1;" value="ACCEPT — child under com. and above www.example.com"><mxGeometry x="450" y="60" width="520" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail5" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#fdeaea;" value='&lt;span style="font-size:12px"&gt;Referral: net. NS ns.evil.net.&lt;/span&gt;'><mxGeometry x="20" y="140" width="400" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail6" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=12;fontColor=#a02020;align=left;verticalAlign=middle;fontStyle=1;" value="REJECT — net. is not under com. → out-of-bailiwick"><mxGeometry x="450" y="140" width="520" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail7" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#fdeaea;" value='&lt;span style="font-size:12px"&gt;Referral: com. NS ns.evil.com.&lt;/span&gt;'><mxGeometry x="20" y="220" width="400" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail8" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=12;fontColor=#a02020;align=left;verticalAlign=middle;fontStyle=1;" value="REJECT — child equals current zone → no progress"><mxGeometry x="450" y="220" width="520" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail9" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#eaf6ea;" value='&lt;span style="font-size:12px"&gt;Glue: ns1.example.com. A 127.0.0.12&lt;/span&gt;'><mxGeometry x="20" y="300" width="400" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail10" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=12;fontColor=#1e6b1e;align=left;verticalAlign=middle;fontStyle=1;" value="ACCEPT — glue owner lies inside com."><mxGeometry x="450" y="300" width="520" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail11" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#fdeaea;" value='&lt;span style="font-size:12px"&gt;Glue: ns.dnshost.org. A 6.6.6.6&lt;/span&gt;'><mxGeometry x="20" y="380" width="400" height="60" as="geometry"/></mxCell>
+        <mxCell id="bail12" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=12;fontColor=#a02020;align=left;verticalAlign=middle;fontStyle=1;" value="REJECT — .com server cannot vouch for .org → dropped"><mxGeometry x="450" y="380" width="520" height="60" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

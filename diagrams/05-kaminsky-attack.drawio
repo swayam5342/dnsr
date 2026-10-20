@@ -1,0 +1,19 @@
+<mxfile host="app.diagrams.net" pages="1">
+  <diagram id="kam" name="Kaminsky-Style Cache Poisoning">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="kam2" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#f6ecf7;" value='&lt;b style="font-size:14px"&gt;Victim resolver&lt;/b&gt;&lt;br&gt;&lt;span style="font-size:10px"&gt;asks: random123.bank.com A&lt;br&gt;waits for ID match&lt;/span&gt;'><mxGeometry x="20" y="160" width="180" height="110" as="geometry"/></mxCell>
+        <mxCell id="kam3" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#eaf6ea;" value='&lt;b style="font-size:14px"&gt;Real bank.com NS&lt;/b&gt;&lt;br&gt;&lt;span style="font-size:11px"&gt;legitimate answer&lt;/span&gt;'><mxGeometry x="580" y="50" width="200" height="90" as="geometry"/></mxCell>
+        <mxCell id="kam4" parent="1" vertex="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;strokeColor=#222222;strokeWidth=1.3;fontFamily=Times New Roman;fillColor=#fdeaea;" value='&lt;b style="font-size:14px"&gt;Off-path attacker&lt;/b&gt;&lt;br&gt;&lt;span style="font-size:11px"&gt;floods guessed IDs&lt;/span&gt;'><mxGeometry x="580" y="290" width="200" height="90" as="geometry"/></mxCell>
+        <mxCell id="kam5" parent="1" edge="1" source="kam2" target="kam3" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#222222;strokeWidth=1.2;fontStyle=2;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Times New Roman;exitX=1;exitY=0.15;entryX=0;entryY=0.4;" value="query (ID = ?, port = ?)"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="kam6" parent="1" edge="1" source="kam3" target="kam2" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#222222;strokeWidth=1.2;fontStyle=2;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Times New Roman;exitX=0;exitY=0.75;entryX=1;entryY=0.3;" value="real reply (may arrive late)"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="kam7" parent="1" edge="1" source="kam4" target="kam2" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#222222;strokeWidth=1.2;fontStyle=2;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Times New Roman;exitX=0;exitY=0.3;entryX=1;entryY=0.55;strokeColor=#c0392b;" value=""><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="kam8" parent="1" edge="1" source="kam4" target="kam2" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#222222;strokeWidth=1.2;fontStyle=2;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Times New Roman;exitX=0;exitY=0.5;entryX=1;entryY=0.7;strokeColor=#c0392b;" value=""><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="kam9" parent="1" edge="1" source="kam4" target="kam2" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#222222;strokeWidth=1.2;fontStyle=2;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Times New Roman;exitX=0;exitY=0.7;entryX=1;entryY=0.85;strokeColor=#c0392b;" value=""><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="kam10" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Times New Roman;fontSize=11;fontColor=#c0392b;align=center;verticalAlign=middle;fontStyle=0;" value="forged replies: ID = 0001, 0002, …&lt;br&gt;NS bank.com → ns.evil.com&lt;br&gt;glue ns.bank.com A 6.6.6.6"><mxGeometry x="240" y="300" width="260" height="70" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
